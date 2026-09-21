@@ -6,7 +6,7 @@
   User.Read is enabled by default; optional OIDC scopes can be selected.
   For OIDC/CC clients, creates the cc_client application role on a selected API,
   assigns it to the client service principal, and grants the assignment.
-  CC/OIDC clients default to requestedAccessTokenVersion = 2 in the app manifest.
+  OIDC/CC clients and Custom API applications default to requestedAccessTokenVersion = 2 in the app manifest.
 
   Naming rules:
     OIDC       -> cc_client
@@ -224,11 +224,11 @@ function Configure-Environment {
             -Body (@{ displayName=$displayName; signInAudience='AzureADMyOrg' } | ConvertTo-Json) -ContentType 'application/json'
     }
 
-    if ($type.Name -eq 'OIDC') {
+    if ($type.Name -in @('OIDC', 'Custom API')) {
         $manifestPatch = @{ requestedAccessTokenVersion = 2 }
         Invoke-MgGraphRequest -Method PATCH -Uri "https://graph.microsoft.com/v1.0/applications/$($app.id)" `
             -Body ($manifestPatch | ConvertTo-Json -Depth 10) -ContentType 'application/json'
-        Write-Host 'Defaulted CC/OIDC app manifest requestedAccessTokenVersion to 2.' -ForegroundColor Green
+        Write-Host "Defaulted $($type.Name) app manifest requestedAccessTokenVersion to 2." -ForegroundColor Green
     }
 
     Enable-GraphPermissions -Application $app -PermissionNames $graphPermissions
