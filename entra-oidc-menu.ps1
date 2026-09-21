@@ -232,8 +232,14 @@ function Configure-Environment {
     }
 
     Enable-GraphPermissions -Application $app -PermissionNames $graphPermissions
+
     $ccRole = $null
-    if ($type.Name -eq 'OIDC') { $ccRole = Configure-CcClientAppRole -ClientApplication $app }
+    if ($type.Name -eq 'OIDC') {
+        $ccRole = Configure-CcClientAppRole -ClientApplication $app
+    }
+    elseif ($type.Name -eq 'Custom API') {
+        Write-Host 'Custom API app: skipping app-role assignment and grant to avoid assigning this API as a client.' -ForegroundColor Yellow
+    }
 
     if ($type.Redirect) {
         $section = @{}
@@ -242,8 +248,8 @@ function Configure-Environment {
             -Body ($section | ConvertTo-Json -Depth 10) -ContentType 'application/json'
     }
 
-    $credential = @{ passwordCredential=@{ displayName="build-$($Environment.ToLower())-$([DateTime]::UtcNow.ToString('yyyyMMddHHmmss'))"; endDateTime=[DateTime]::UtcNow.AddDays([int]$days).ToString('o') } } | ConvertTo-Json -Depth 10
-    $password = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/applications/$($app.id)/addPassword" -Body $credential -ContentType 'application/json'
+    $credential = @{ passwordCredential=@{ displayName="build-$($Environment.ToLower())-$([DateTime]::UtcNow.ToString('yyyyMMddHHmmss'))"; endDateTime=[DateTime]::UtcNow.AddDays([int]$days).ToString('o') } }
+    $password = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/applications/$($app.id)/addPassword" -Body ($credential | ConvertTo-Json -Depth 10) -ContentType 'application/json'
     if ([string]::IsNullOrWhiteSpace($password.secretText)) { throw 'Microsoft Graph did not return secretText.' }
 
     Save-Config ([PSCustomObject]@{
