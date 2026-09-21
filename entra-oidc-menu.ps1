@@ -1,5 +1,4 @@
-<#
-.SYNOPSIS
+<#!n.SYNOPSIS
   Interactive Entra OIDC/OAuth configuration helper for PowerShell.
 
 .DESCRIPTION
@@ -202,9 +201,13 @@ function Configure-Environment {
     $baseName = Read-Host 'Application base name [personal]'
     if ([string]::IsNullOrWhiteSpace($baseName)) { $baseName = 'personal' }
     $environmentPart = if ($Environment -eq 'Lower') { 'qa-' } else { '' }
-    $defaultName = "$baseName-$environmentPart$($type.Suffix)"
+    $applicationPrefix = 'application-'
+    $defaultName = "$applicationPrefix$baseName-$environmentPart$($type.Suffix)"
     $displayName = Read-Host "Application display name [$defaultName]"
     if ([string]::IsNullOrWhiteSpace($displayName)) { $displayName = $defaultName }
+    elseif (-not $displayName.StartsWith($applicationPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $displayName = "$applicationPrefix$displayName"
+    }
     $redirectUri = $null
     if ($type.Redirect) { $redirectUri = Read-Required "$Environment $($type.Name) redirect URI" }
     $scope = Read-Required "$Environment API scope value (for example access_as_user)"
