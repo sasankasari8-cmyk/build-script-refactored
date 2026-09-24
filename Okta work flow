@@ -1,25 +1,48 @@
-name: Okta PowerShell Workflow
+name: Create Okta User
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-  schedule:
-    - cron: '0 8 * * 1'
+    inputs:
+      first_name:
+        description: 'User first name'
+        required: true
+        default: 'Sa'
+        type: string
+      last_name:
+        description: 'User last name'
+        required: true
+        default: 'da'
+        type: string
+      email:
+        description: 'User email address'
+        required: true
+        default: 'sasdasari09@zohomail.com'
+        type: string
+      login:
+        description: 'Okta username/login'
+        required: true
+        default: 'sasdasari09'
+        type: string
+      activate:
+        description: 'Activate the user immediately'
+        required: true
+        default: true
+        type: boolean
 
 jobs:
-  okta-powershell:
+  create-okta-user:
     runs-on: windows-latest
     env:
       OKTA_ORG_URL: ${{ secrets.OKTA_ORG_URL }}
       OKTA_API_TOKEN: ${{ secrets.OKTA_API_TOKEN }}
+      USER_FIRST_NAME: ${{ inputs.first_name }}
+      USER_LAST_NAME: ${{ inputs.last_name }}
+      USER_EMAIL: ${{ inputs.email }}
+      USER_LOGIN: ${{ inputs.login }}
+      USER_ACTIVATE: ${{ inputs.activate }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Run Okta PowerShell script
+      - name: Create Okta user
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -36,10 +59,21 @@ jobs:
           $headers = @{
             Authorization = "SSWS $($env:OKTA_API_TOKEN)"
             Accept        = 'application/json'
+            'Content-Type' = 'application/json'
           }
 
-          $uri = "$baseUrl/api/v1/users?limit=1"
-          $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers
+          $profile = @{
+            firstName = $env:USER_FIRST_NAME
+            lastName  = $env:USER_LAST_NAME
+            email     = $env:USER_EMAIL
+            login     = $env:USER_LOGIN
+          }
 
-          Write-Host "Successfully connected to Okta."
-          Write-Host "The Okta API returned $(@($response).Count) user record(s) in the test request."
+          $activate = [System.Convert]::ToBoolean($env:USER_ACTIVATE)
+          $uri = "$baseUrl/api/v1/users?activate=$($activate.ToString().ToLowerInvariant())"
+          $body = $profile | ConvertTo-Json -Compress
+          $user = Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -Body $body
+
+          Write-Host "Successfully created Okta user '$($user.profile.login)'."
+          Write-Host "User ID: $($user.id)"
+          Write-Host "Status: $($user.status)"
