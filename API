@@ -1,26 +1,30 @@
 #!/usr/bin/env pwsh
 <#
 .SYNOPSIS
-  Minimal Okta OIDC authentication API.
+  HTTPS-only Okta OIDC authentication API.
 
 .DESCRIPTION
-  Starts a small HTTP API that authenticates users with Okta using the
+  Starts a small HTTPS API that authenticates users with Okta using the
   Authorization Code flow with PKCE. The API never receives or stores a user's
   Okta password. Sessions are opaque, server-side cookies kept in memory.
 
   Required environment variables:
     OKTA_ISSUER       https://your-org.okta.com/oauth2/default
     OKTA_CLIENT_ID    The Okta OIDC application's client ID
-    OKTA_REDIRECT_URI http://localhost:8080/auth/callback
+    OKTA_REDIRECT_URI https://localhost:8443/auth/callback
 
   Optional environment variables:
     OKTA_CLIENT_SECRET  Secret for a confidential web application
-    API_LISTEN_PREFIX   HttpListener prefix; defaults to http://localhost:8080/
+    API_LISTEN_PREFIX   HTTPS listener prefix; defaults to https://localhost:8443/
     SESSION_TTL_MINUTES Session lifetime; defaults to 60
 
-  Configure the same redirect URI in the Okta application. For production,
-  use HTTPS, a confidential client, a durable session store, and a reverse
-  proxy/TLS terminator instead of the in-memory session store below.
+  HTTPS REQUIREMENTS:
+    - Every configured URL must use https://. HTTP prefixes and redirect URIs
+      are rejected at startup.
+    - HttpListener requires an HTTPS certificate binding before startup. On
+      Windows, bind a certificate to the port, for example:
+        netsh http add sslcert ipport=0.0.0.0:8443 certhash=CERT_THUMBPRINT appid={00112233-4455-6677-8899-aabbccddeeff}
+    - Configure the identical HTTPS redirect URI in the Okta application.
 
   Routes:
     GET /health       Liveness check
@@ -38,9 +42,7 @@ $ErrorActionPreference = 'Stop'
 
 function Get-RequiredEnvironmentValue([string] $Name) {
     $value = [Environment]::GetEnvironmentVariable($Name)
-    if ([string]::IsNullOrWhiteSpace($value)) {
-        throw "Required environment variable '$Name' is not configured."
-    }
+    if ([string]::IsNullOrWhiteSpace($value)) { throw "Required environment variable '$Name' is not configured." }
     return $value.Trim()
 }
 
@@ -49,22 +51,27 @@ $clientId = Get-RequiredEnvironmentValue 'OKTA_CLIENT_ID'
 $redirectUri = Get-RequiredEnvironmentValue 'OKTA_REDIRECT_URI'
 $clientSecret = [Environment]::GetEnvironmentVariable('OKTA_CLIENT_SECRET')
 $listenPrefix = [Environment]::GetEnvironmentVariable('API_LISTEN_PREFIX')
-if ([string]::IsNullOrWhiteSpace($listenPrefix)) { $listenPrefix = 'http://localhost:8080/' }
+if ([string]::IsNullOrWhiteSpace($listenPrefix)) { $listenPrefix = 'https://localhost:8443/' }
 $listenPrefix = $listenPrefix.TrimEnd('/') + '/'
+
+foreach ($url in @(@{ Name = 'OKTA_ISSUER'; Value = $issuer }, @{ Name = 'OKTA_REDIRECT_URI'; Value = $redirectUri }, @{ Name = 'API_LISTEN_PREFIX'; Value = $listenPrefix })) {
+    $parsed = $null
+    if (-not [Uri]::TryCreate($url.Value, [UriKind]::Absolute, [ref]$parsed) -or $parsed.Scheme -ne 'https') {
+        throw "$($url.Name) must be an absolute HTTPS URL. HTTP is not supported."
+    }
+}
 
 $ttlMinutes = 60
 $ttlValue = [Environment]::GetEnvironmentVariable('SESSION_TTL_MINUTES')
 if (-not [string]::IsNullOrWhiteSpace($ttlValue)) {
-    if (-not [int]::TryParse($ttlValue, [ref]$ttlMinutes) -or $ttlMinutes -lt 1) {
-        throw 'SESSION_TTL_MINUTES must be a positive integer.'
-    }
+    if (-not [int]::TryParse($ttlValue, [ref]$ttlMinutes) -or $ttlMinutes -lt 1) { throw 'SESSION_TTL_MINUTES must be a positive integer.' }
 }
 
 $http = [System.Net.Http.HttpClient]::new()
 $http.Timeout = [TimeSpan]::FromSeconds(30)
 $discovery = $null
 $sessions = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new()
-$pendingStates = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new()
+$pendingStates = [System.Collections.Concurrent.Concurrent.ConcurrentDictionary[string, object]]::new()
 
 function Get-DiscoveryDocument {
     if ($script:discovery) { return $script:discovery }
@@ -85,11 +92,10 @@ function Get-PkceChallenge([string] $Verifier) {
     return [Convert]::ToBase64String($hash).TrimEnd('=').Replace('+', '-').Replace('/', '_')
 }
 
-function Send-Response($Context, [int] $StatusCode, $Body, [string] $ContentType = 'application/json; charset=utf-8', [hashtable] $Headers = @{}) {
-    $json = if ($ContentType.StartsWith('application/json')) { $Body | ConvertTo-Json -Depth 10 -Compress } else { [string]$Body }
-    $bytes = [Text.Encoding]::UTF8.GetBytes($json)
+function Send-Response($Context, [int] $StatusCode, $Body, [hashtable] $Headers = @{}) {
+    $bytes = [Text.Encoding]::UTF8.GetBytes(($Body | ConvertTo-Json -Depth 10 -Compress))
     $Context.Response.StatusCode = $StatusCode
-    $Context.Response.ContentType = $ContentType
+    $Context.Response.ContentType = 'application/json; charset=utf-8'
     $Context.Response.ContentLength64 = $bytes.Length
     foreach ($key in $Headers.Keys) { $Context.Response.Headers[$key] = [string]$Headers[$key] }
     $Context.Response.OutputStream.Write($bytes, 0, $bytes.Length)
@@ -114,8 +120,7 @@ function Get-Session($Request) {
     $session = $null
     if (-not $sessions.TryGetValue($sessionId, [ref]$session)) { return $null }
     if ($session.ExpiresAt -lt [DateTimeOffset]::UtcNow) {
-        $discarded = $null
-        $sessions.TryRemove($sessionId, [ref]$discarded) | Out-Null
+        $discarded = $null; $sessions.TryRemove($sessionId, [ref]$discarded) | Out-Null
         return $null
     }
     return $session
@@ -124,10 +129,10 @@ function Get-Session($Request) {
 function New-Session($TokenResponse, $UserInfo) {
     $id = New-RandomBase64Url 32
     $session = [PSCustomObject]@{
-        AccessToken  = $TokenResponse.access_token
+        AccessToken = $TokenResponse.access_token
         RefreshToken = $TokenResponse.refresh_token
-        User         = $UserInfo
-        ExpiresAt    = [DateTimeOffset]::UtcNow.AddMinutes($ttlMinutes)
+        User = $UserInfo
+        ExpiresAt = [DateTimeOffset]::UtcNow.AddMinutes($ttlMinutes)
     }
     $sessions[$id] = $session
     return @{ Id = $id; Value = $session }
@@ -136,7 +141,7 @@ function New-Session($TokenResponse, $UserInfo) {
 function Add-SessionCookie($Response, [string] $Value) {
     $cookie = [System.Net.Cookie]::new('okta_session', $Value, '/')
     $cookie.HttpOnly = $true
-    $cookie.Secure = $redirectUri.StartsWith('https://', [StringComparison]::OrdinalIgnoreCase)
+    $cookie.Secure = $true
     $cookie.SameSite = [System.Net.SameSiteMode]::Lax
     $cookie.Expires = [DateTime]::UtcNow.AddMinutes($ttlMinutes)
     $Response.AppendCookie($cookie)
@@ -144,21 +149,17 @@ function Add-SessionCookie($Response, [string] $Value) {
 
 function Remove-SessionCookie($Response) {
     $cookie = [System.Net.Cookie]::new('okta_session', '', '/')
-    $cookie.HttpOnly = $true
-    $cookie.Secure = $redirectUri.StartsWith('https://', [StringComparison]::OrdinalIgnoreCase)
+    $cookie.HttpOnly = $true; $cookie.Secure = $true
     $cookie.Expires = [DateTime]::UtcNow.AddYears(-1)
     $Response.AppendCookie($cookie)
 }
 
 function ConvertTo-FormBody([hashtable] $Values) {
-    return (($Values.GetEnumerator() | ForEach-Object {
-        '{0}={1}' -f [Uri]::EscapeDataString([string]$_.Key), [Uri]::EscapeDataString([string]$_.Value)
-    }) -join '&')
+    return (($Values.GetEnumerator() | ForEach-Object { '{0}={1}' -f [Uri]::EscapeDataString([string]$_.Key), [Uri]::EscapeDataString([string]$_.Value) }) -join '&')
 }
 
 function Invoke-TokenRequest([hashtable] $Values) {
-    $body = ConvertTo-FormBody $Values
-    $content = [System.Net.Http.StringContent]::new($body, [Text.Encoding]::UTF8, 'application/x-www-form-urlencoded')
+    $content = [System.Net.Http.StringContent]::new((ConvertTo-FormBody $Values), [Text.Encoding]::UTF8, 'application/x-www-form-urlencoded')
     $response = $http.PostAsync((Get-DiscoveryDocument).token_endpoint, $content).Result
     $payload = $response.Content.ReadAsStringAsync().Result | ConvertFrom-Json
     if (-not $response.IsSuccessStatusCode) { throw "Okta token exchange failed: $($payload.error_description ?? $payload.error)" }
@@ -176,28 +177,15 @@ function Invoke-UserInfo([string] $AccessToken) {
 
 function Handle-Request($Context) {
     $request = $Context.Request
-    $path = $request.Url.AbsolutePath.TrimEnd('/')
-    if ([string]::IsNullOrWhiteSpace($path)) { $path = '/' }
+    $path = $request.Url.AbsolutePath.TrimEnd('/'); if ([string]::IsNullOrWhiteSpace($path)) { $path = '/' }
     try {
         switch ($path) {
-            '/health' {
-                Send-Response $Context 200 @{ status = 'ok' }
-                return
-            }
+            '/health' { Send-Response $Context 200 @{ status = 'ok' }; return }
             '/auth/login' {
-                $state = New-RandomBase64Url 32
-                $verifier = New-RandomBase64Url 48
-                $pendingStates[$state] = [PSCustomObject]@{
-                    Verifier = $verifier
-                    ExpiresAt = [DateTimeOffset]::UtcNow.AddMinutes(5)
-                }
-                $query = ConvertTo-FormBody @{
-                    client_id = $clientId; response_type = 'code'; response_mode = 'query'
-                    scope = 'openid profile email'; redirect_uri = $redirectUri
-                    state = $state; code_challenge = (Get-PkceChallenge $verifier); code_challenge_method = 'S256'
-                }
-                Send-Redirect $Context "$((Get-DiscoveryDocument).authorization_endpoint)?$query"
-                return
+                $state = New-RandomBase64Url 32; $verifier = New-RandomBase64Url 48
+                $pendingStates[$state] = [PSCustomObject]@{ Verifier = $verifier; ExpiresAt = [DateTimeOffset]::UtcNow.AddMinutes(5) }
+                $query = ConvertTo-FormBody @{ client_id=$clientId; response_type='code'; response_mode='query'; scope='openid profile email'; redirect_uri=$redirectUri; state=$state; code_challenge=(Get-PkceChallenge $verifier); code_challenge_method='S256' }
+                Send-Redirect $Context "$((Get-DiscoveryDocument).authorization_endpoint)?$query"; return
             }
             '/auth/callback' {
                 $state = $request.QueryString['state']; $code = $request.QueryString['code']
@@ -206,53 +194,43 @@ function Handle-Request($Context) {
                 if (-not $pendingStates.TryRemove($state, [ref]$pending) -or $pending.ExpiresAt -lt [DateTimeOffset]::UtcNow) { throw 'Invalid or expired OAuth state.' }
                 $tokenValues = @{ grant_type='authorization_code'; client_id=$clientId; code=$code; redirect_uri=$redirectUri; code_verifier=$pending.Verifier }
                 if (-not [string]::IsNullOrWhiteSpace($clientSecret)) { $tokenValues.client_secret = $clientSecret }
-                $tokens = Invoke-TokenRequest $tokenValues
-                $user = Invoke-UserInfo $tokens.access_token
-                $session = New-Session $tokens $user
-                Add-SessionCookie $Context.Response $session.Id
-                Send-Redirect $Context '/auth/me'
-                return
+                $tokens = Invoke-TokenRequest $tokenValues; $user = Invoke-UserInfo $tokens.access_token; $session = New-Session $tokens $user
+                Add-SessionCookie $Context.Response $session.Id; Send-Redirect $Context '/auth/me'; return
             }
             '/auth/me' {
                 $session = Get-Session $request
-                if (-not $session) { Send-Response $Context 401 @{ error = 'unauthorized'; message = 'Sign in at /auth/login.' }; return }
-                Send-Response $Context 200 $session.User
-                return
+                if (-not $session) { Send-Response $Context 401 @{ error='unauthorized'; message='Sign in at /auth/login.' }; return }
+                Send-Response $Context 200 $session.User; return
             }
             '/auth/logout' {
                 $sessionId = Get-CookieValue $request 'okta_session'; $session = Get-Session $request
-                if ($session) {
-                    $discoveryDocument = Get-DiscoveryDocument
-                    if ($discoveryDocument.revocation_endpoint) {
-                        $revokeValues = @{ token=$session.AccessToken; client_id=$clientId; token_type_hint='access_token' }
-                        if (-not [string]::IsNullOrWhiteSpace($clientSecret)) { $revokeValues.client_secret = $clientSecret }
-                        $content = [System.Net.Http.StringContent]::new((ConvertTo-FormBody $revokeValues), [Text.Encoding]::UTF8, 'application/x-www-form-urlencoded')
-                        $http.PostAsync($discoveryDocument.revocation_endpoint, $content).Result.Dispose()
-                    }
+                if ($session -and (Get-DiscoveryDocument).revocation_endpoint) {
+                    $revokeValues = @{ token=$session.AccessToken; client_id=$clientId; token_type_hint='access_token' }
+                    if (-not [string]::IsNullOrWhiteSpace($clientSecret)) { $revokeValues.client_secret = $clientSecret }
+                    $content = [System.Net.Http.StringContent]::new((ConvertTo-FormBody $revokeValues), [Text.Encoding]::UTF8, 'application/x-www-form-urlencoded')
+                    $http.PostAsync((Get-DiscoveryDocument).revocation_endpoint, $content).Result.Dispose()
                 }
                 if ($sessionId) { $discarded = $null; $sessions.TryRemove($sessionId, [ref]$discarded) | Out-Null }
-                Remove-SessionCookie $Context.Response
-                Send-Response $Context 200 @{ status = 'signed_out' }
-                return
+                Remove-SessionCookie $Context.Response; Send-Response $Context 200 @{ status='signed_out' }; return
             }
-            default { Send-Response $Context 404 @{ error = 'not_found' } }
+            default { Send-Response $Context 404 @{ error='not_found' } }
         }
     } catch {
         Write-Warning $_.Exception.Message
-        Send-Response $Context 500 @{ error = 'authentication_error'; message = 'Authentication request could not be completed.' }
+        Send-Response $Context 500 @{ error='authentication_error'; message='Authentication request could not be completed.' }
     }
 }
 
 $listener = [System.Net.HttpListener]::new()
 $listener.Prefixes.Add($listenPrefix)
-$listener.Start()
-Write-Host "Okta authentication API listening on $listenPrefix"
-Write-Host 'Configure OKTA_ISSUER, OKTA_CLIENT_ID, and OKTA_REDIRECT_URI before starting.'
 try {
-    while ($listener.IsListening) {
-        $context = $listener.GetContext()
-        Handle-Request $context
-    }
+    $listener.Start()
+} catch {
+    throw "Unable to start HTTPS listener at '$listenPrefix'. Ensure an SSL certificate is bound to this host and port. $($_.Exception.Message)"
+}
+Write-Host "Okta authentication API listening on $listenPrefix"
+try {
+    while ($listener.IsListening) { Handle-Request $listener.GetContext() }
 } finally {
     $listener.Stop(); $listener.Close(); $http.Dispose()
 }
