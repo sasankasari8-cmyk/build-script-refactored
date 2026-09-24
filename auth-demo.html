@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OIDC Demo</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 900px;
+      margin: 40px auto;
+      padding: 20px;
+      color: #1f2937;
+      background: #f8fafc;
+    }
+    .card {
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+    button {
+      background: #2563eb;
+      color: white;
+      border: 0;
+      padding: 12px 18px;
+      border-radius: 8px;
+      cursor: pointer;
+      margin-right: 10px;
+    }
+    button.secondary {
+      background: #475569;
+    }
+    pre {
+      white-space: pre-wrap;
+      background: #0f172a;
+      color: #e2e8f0;
+      padding: 14px;
+      border-radius: 8px;
+      overflow: auto;
+    }
+    .error {
+      color: #b91c1c;
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+  <h1>OIDC Authentication Demo</h1>
+
+  <div class="card">
+    <button id="loginBtn">Login</button>
+    <button id="meBtn" class="secondary">Fetch /auth/me</button>
+    <button id="logoutBtn" class="secondary">Logout</button>
+  </div>
+
+  <div class="card">
+    <h2>Result</h2>
+    <div id="status">Not signed in.</div>
+    <pre id="output">{}</pre>
+  </div>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const outputEl = document.getElementById('output');
+
+    const render = (message, payload) => {
+      statusEl.textContent = message;
+      outputEl.textContent = JSON.stringify(payload, null, 2);
+    };
+
+    async function fetchJson(url, options = {}) {
+      const response = await fetch(url, {
+        credentials: 'include',
+        ...options
+      });
+
+      const text = await response.text();
+      let data = {};
+      try { data = text ? JSON.parse(text) : {}; } catch (e) { data = { raw: text }; }
+
+      if (!response.ok) {
+        throw new Error((data && data.message) || `HTTP ${response.status}`);
+      }
+
+      return data;
+    }
+
+    document.getElementById('loginBtn').addEventListener('click', () => {
+      window.location.href = '/auth/login';
+    });
+
+    document.getElementById('meBtn').addEventListener('click', async () => {
+      try {
+        const data = await fetchJson('/auth/me', { method: 'GET' });
+        render('Authenticated user profile', data);
+      } catch (error) {
+        render('Authentication required', { error: error.message });
+      }
+    });
+
+    document.getElementById('logoutBtn').addEventListener('click', async () => {
+      try {
+        const data = await fetchJson('/auth/logout', { method: 'POST' });
+        render('Signed out', data);
+      } catch (error) {
+        render('Logout failed', { error: error.message });
+      }
+    });
+
+    window.addEventListener('DOMContentLoaded', async () => {
+      try {
+        const health = await fetchJson('/health', { method: 'GET' });
+        render('Service ready', health);
+      } catch (error) {
+        render('Service unavailable', { error: error.message });
+      }
+    });
+  </script>
+</body>
+</html>
