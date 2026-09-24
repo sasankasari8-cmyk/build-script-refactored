@@ -1,1 +1,45 @@
+name: Okta PowerShell Workflow
 
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 8 * * 1'
+
+jobs:
+  okta-powershell:
+    runs-on: windows-latest
+    env:
+      OKTA_ORG_URL: ${{ secrets.OKTA_ORG_URL }}
+      OKTA_API_TOKEN: ${{ secrets.OKTA_API_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Okta PowerShell script
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ([string]::IsNullOrWhiteSpace($env:OKTA_ORG_URL)) {
+            throw 'The OKTA_ORG_URL secret is not configured.'
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:OKTA_API_TOKEN)) {
+            throw 'The OKTA_API_TOKEN secret is not configured.'
+          }
+
+          $baseUrl = $env:OKTA_ORG_URL.TrimEnd('/')
+          $headers = @{
+            Authorization = "SSWS $($env:OKTA_API_TOKEN)"
+            Accept        = 'application/json'
+          }
+
+          $uri = "$baseUrl/api/v1/users?limit=1"
+          $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers
+
+          Write-Host "Successfully connected to Okta."
+          Write-Host "The Okta API returned $(@($response).Count) user record(s) in the test request."
