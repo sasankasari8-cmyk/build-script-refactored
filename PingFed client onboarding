@@ -1,1 +1,189 @@
+<#!
+.SYNOPSIS
+  Onboards an OAuth/OIDC client in PingFederate through the Admin REST API.
 
+.DESCRIPTION
+  Creates a client at /pf-admin-api/v1/oauth/clients. With -UpdateExisting, an
+  existing client is replaced using PUT. The script is idempotent when the
+  client already exists and -UpdateExisting is supplied.
+
+  The PingFederate administrator credentials are read as a PSCredential so that
+  they are never placed in the command line or written to the console. The
+  generated client secret is printed once only when PingFederate returns one.
+
+  PingFederate Admin API availability and field names can vary by version.
+  Confirm that the OAuth client model in your PingFederate version supports the
+  selected grant types and properties before running in production.
+
+.EXAMPLE
+  .\PingFed-client-onboarding.ps1 `
+    -AdminBaseUrl 'https://pingfed-admin.example.com' `
+    -ClientId 'acme-service' `
+    -ClientName 'Acme service' `
+    -GrantTypes @('CLIENT_CREDENTIALS') `
+    -Scopes @('openid','profile') `
+    -UpdateExisting
+
+.EXAMPLE
+  $admin = Get-Credential
+  .\PingFed-client-onboarding.ps1 `
+    -AdminBaseUrl 'https://pingfed-admin.example.com' `
+    -AdminCredential $admin `
+    -ClientId 'acme-web' `
+    -ClientName 'Acme web application' `
+    -GrantTypes @('AUTHORIZATION_CODE') `
+    -RedirectUris @('https://app.example.com/auth/callback') `
+    -Scopes @('openid','profile') `
+    -RequireProofKeyForCodeExchange `
+    -UpdateExisting
+
+.NOTES
+  Required administrator permissions: access to the PingFederate Admin API and
+  permission to manage OAuth clients. Do not commit the generated secret.
+#>
+
+[CmdletBinding(SupportsShouldProcess)]
+param(
+    [Parameter(Mandatory)]
+    [ValidatePattern('^https://')]
+    [string]$AdminBaseUrl,
+
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
+    [string]$ClientId,
+
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
+    [string]$ClientName,
+
+    [Parameter(Mandatory)]
+    [ValidateSet('AUTHORIZATION_CODE','CLIENT_CREDENTIALS','REFRESH_TOKEN','IMPLICIT','RESOURCE_OWNER_PASSWORD_CREDENTIALS')]
+    [string[]]$GrantTypes,
+
+    [string[]]$RedirectUris = @(),
+
+    [string[]]$Scopes = @(),
+
+    [ValidateSet('CLIENT_SECRET','NONE','CERTIFICATE')]
+    [string]$ClientAuthnType = 'CLIENT_SECRET',
+
+    [ValidateSet('SECRET','NONE','TLS_CLIENT_AUTH','PRIVATE_KEY_JWT')]
+    [string]$TokenEndpointAuthMethod = 'SECRET',
+
+    [string]$Description = '',
+
+    [switch]$RequireProofKeyForCodeExchange,
+
+    [switch]$UpdateExisting,
+
+    [System.Management.Automation.PSCredential]$AdminCredential,
+
+    [string]$AccessTokenManagerId = ''
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$apiRoot = "$($AdminBaseUrl.TrimEnd('/'))/pf-admin-api/v1"
+$clientUri = "$apiRoot/oauth/clients/$([Uri]::EscapeDataString($ClientId))"
+$collectionUri = "$apiRoot/oauth/clients"
+
+function Get-AdminCredential {
+    if ($null -ne $AdminCredential) { return $AdminCredential }
+    return Get-Credential -Message 'PingFederate administrator credentials'
+}
+
+function New-AdminHeaders([System.Management.Automation.PSCredential]$Credential) {
+    $user = $Credential.UserName
+    $password = $Credential.GetNetworkCredential().Password
+    $raw = [Text.Encoding]::UTF8.GetBytes("$user`:$password")
+    return @{
+        Authorization = "Basic $([Convert]::ToBase64String($raw))"
+        Accept = 'application/json'
+        'Content-Type' = 'application/json'
+    }
+}
+
+function Invoke-PingFedApi {
+    param(
+        [Parameter(Mandatory)][ValidateSet('GET','POST','PUT')][string]$Method,
+        [Parameter(Mandatory)][string]$Uri,
+        [hashtable]$Headers,
+        [object]$Body
+    )
+
+    $params = @{ Method = $Method; Uri = $Uri; Headers = $Headers; ErrorAction = 'Stop' }
+    if ($null -ne $Body) { $params.Body = $Body | ConvertTo-Json -Depth 20 }
+    try {
+        return Invoke-RestMethod @params
+    } catch {
+        $status = $_.Exception.Response.StatusCode.value__
+        $detail = $_.ErrorDetails.Message
+        if ([string]::IsNullOrWhiteSpace($detail)) { $detail = $_.Exception.Message }
+        throw "PingFederate API request failed ($Method $Uri) [$status]: $detail"
+    }
+}
+
+if ($GrantTypes -contains 'AUTHORIZATION_CODE' -and $RedirectUris.Count -eq 0) {
+    throw 'RedirectUris is required when GrantTypes contains AUTHORIZATION_CODE.'
+}
+if ($GrantTypes -notcontains 'AUTHORIZATION_CODE' -and $RedirectUris.Count -gt 0) {
+    Write-Warning 'RedirectUris were supplied for a client without AUTHORIZATION_CODE; PingFederate may reject them.'
+}
+if ($ClientAuthnType -eq 'NONE' -and $TokenEndpointAuthMethod -ne 'NONE') {
+    throw 'TokenEndpointAuthMethod must be NONE when ClientAuthnType is NONE.'
+}
+if ($GrantTypes -contains 'CLIENT_CREDENTIALS' -and $ClientAuthnType -eq 'NONE') {
+    throw 'CLIENT_CREDENTIALS normally requires client authentication; choose CLIENT_SECRET or CERTIFICATE.'
+}
+
+$credential = Get-AdminCredential
+$headers = New-AdminHeaders $credential
+
+$payload = [ordered]@{
+    clientId = $ClientId
+    name = $ClientName
+    description = $Description
+    enabled = $true
+    clientAuthnType = $ClientAuthnType
+    grantTypes = @($GrantTypes)
+    redirectUris = @($RedirectUris)
+    scopes = @($Scopes)
+    tokenEndpointAuthMethod = $TokenEndpointAuthMethod
+    requireProofKeyForCodeExchange = [bool]$RequireProofKeyForCodeExchange
+}
+if (-not [string]::IsNullOrWhiteSpace($AccessTokenManagerId)) {
+    $payload.accessTokenManagerRef = @{ id = $AccessTokenManagerId }
+}
+
+$existing = $null
+try {
+    $existing = Invoke-PingFedApi -Method GET -Uri $clientUri -Headers $headers
+} catch {
+    if ($_.Exception.Message -notmatch '\[404\]') { throw }
+}
+
+$method = if ($null -ne $existing) { 'PUT' } else { 'POST' }
+$target = if ($method -eq 'POST') { $collectionUri } else { $clientUri }
+if ($method -eq 'PUT' -and -not $UpdateExisting) {
+    throw "OAuth client '$ClientId' already exists. Re-run with -UpdateExisting to modify it."
+}
+
+$operation = if ($method -eq 'POST') { 'create' } else { 'update' }
+if ($PSCmdlet.ShouldProcess($ClientId, "$operation PingFederate OAuth client")) {
+    $result = Invoke-PingFedApi -Method $method -Uri $target -Headers $headers -Body $payload
+    Write-Host "Successfully $operation`d PingFederate OAuth client '$ClientId'." -ForegroundColor Green
+    if ($result.clientSecret) {
+        Write-Host 'Client secret (store it securely; it will not be shown again):' -ForegroundColor Yellow
+        Write-Host $result.clientSecret
+    } elseif ($ClientAuthnType -eq 'CLIENT_SECRET') {
+        Write-Warning 'PingFederate did not return a client secret. Retrieve or rotate it using your approved secret-management process.'
+    }
+    [PSCustomObject]@{
+        ClientId = $result.clientId
+        Name = $result.name
+        Enabled = $result.enabled
+        GrantTypes = (@($result.grantTypes) -join ',')
+        AdminApiResource = $target
+    }
+}
