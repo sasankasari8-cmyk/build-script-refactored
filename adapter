@@ -1,1 +1,527 @@
+#!/usr/bin/env python3
+"""
+PingFederate Custom Authentication Adapter
+========================================
 
+This sample demonstrates how to build a custom authentication adapter in Python
+that can integrate with PingFederate. It includes:
+- Adapter configuration model
+- Authentication request/response handling
+- Session token generation and validation
+- Basic / API key / OAuth2-style adapter implementations
+- Request retry and secure logging utilities
+
+This is a framework example for integration work, not a direct PingFederate SDK.
+In a real deployment, replace the placeholder validation methods with your own
+identity provider or enterprise auth logic.
+"""
+
+import hashlib
+import hmac
+import logging
+import os
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+
+logger = logging.getLogger("pingfederate_adapter")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+
+class AuthenticationMethod(Enum):
+    BASIC = "basic"
+    API_KEY = "api_key"
+    OAUTH2 = "oauth2"
+    SAML = "saml"
+    CUSTOM = "custom"
+
+
+class AdapterStatus(Enum):
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+    ERROR = "error"
+    DEGRADED = "degraded"
+
+
+@dataclass
+class AuthenticationRequest:
+    username: str
+    credentials: Dict[str, Any]
+    request_id: str
+    timestamp: datetime
+    ip_address: Optional[str] = None
+    user_agent: Optional[str] = None
+    context: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class AuthenticationResponse:
+    success: bool
+    user_id: str
+    session_token: str
+    token_expiry: datetime
+    attributes: Dict[str, Any] = field(default_factory=dict)
+    error_message: Optional[str] = None
+    error_code: Optional[str] = None
+
+
+@dataclass
+class AdapterConfiguration:
+    adapter_id: str
+    adapter_name: str
+    adapter_type: str
+    authentication_method: AuthenticationMethod
+    endpoint_url: str
+    api_key: Optional[str] = None
+    secret_key: Optional[str] = None
+    timeout_seconds: int = 30
+    max_retries: int = 3
+    retry_delay_ms: int = 1000
+    enable_caching: bool = True
+    cache_ttl_seconds: int = 3600
+    custom_config: Dict[str, Any] = field(default_factory=dict)
+
+
+class AdapterException(Exception):
+    def __init__(self, message: str, error_code: str = "ADAPTER_ERROR"):
+        self.message = message
+        self.error_code = error_code
+        super().__init__(message)
+
+
+class ConfigurationException(AdapterException):
+    def __init__(self, message: str):
+        super().__init__(message, "CONFIG_ERROR")
+
+
+class AuthenticationFailedException(AdapterException):
+    def __init__(self, message: str):
+        super().__init__(message, "AUTH_FAILED")
+
+
+class ConnectionException(AdapterException):
+    def __init__(self, message: str):
+        super().__init__(message, "CONNECTION_ERROR")
+
+
+class SessionManager:
+    """Creates and validates user sessions for PingFederate adapter integrators."""
+
+    def __init__(self, secret_key: str, ttl_seconds: int = 3600):
+        self.secret_key = secret_key or "change-me-secret"
+        self.ttl_seconds = ttl_seconds
+        self.sessions: Dict[str, Dict[str, Any]] = {}
+
+    def create_session(self, user_id: str, attributes: Dict[str, Any]) -> str:
+        token = self._generate_token(user_id)
+        expiry = datetime.utcnow() + timedelta(seconds=self.ttl_seconds)
+        self.sessions[token] = {
+            "user_id": user_id,
+            "attributes": attributes,
+            "created_at": datetime.utcnow(),
+            "expires_at": expiry,
+            "last_activity": datetime.utcnow(),
+        }
+        logger.info("Session created for user=%s token=%s", user_id, token)
+        return token
+
+    def validate_session(self, session_token: str) -> Tuple[bool, Optional[str]]:
+        session = self.sessions.get(session_token)
+        if not session:
+            return False, None
+
+        if datetime.utcnow() > session["expires_at"]:
+            del self.sessions[session_token]
+            return False, None
+
+        session["last_activity"] = datetime.utcnow()
+        return True, session["user_id"]
+
+    def destroy_session(self, session_token: str) -> bool:
+        if session_token in self.sessions:
+            del self.sessions[session_token]
+            return True
+        return False
+
+    def _generate_token(self, user_id: str) -> str:
+        payload = f"{user_id}:{time.time()}:{os.urandom(16).hex()}"
+        signature = hmac.new(self.secret_key.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+        return signature
+
+
+class AuthenticationAdapter(ABC):
+    def __init__(self, config: AdapterConfiguration):
+        self.config = config
+        self.cache: Dict[str, Tuple[Any, datetime]] = {}
+        self.session_manager = SessionManager(config.secret_key or "default-secret-key", config.cache_ttl_seconds)
+        self.status = AdapterStatus.ACTIVE
+
+    @abstractmethod
+    def authenticate(self, request: AuthenticationRequest) -> AuthenticationResponse:
+        pass
+
+    @abstractmethod
+    def validate_credentials(self, username: str, credentials: Dict[str, Any]) -> bool:
+        pass
+
+    @abstractmethod
+    def get_user_attributes(self, user_id: str) -> Dict[str, Any]:
+        pass
+
+    def _cache_get(self, key: str) -> Optional[Any]:
+        if not self.config.enable_caching:
+            return None
+
+        cached = self.cache.get(key)
+        if not cached:
+            return None
+
+        value, expiry = cached
+        if datetime.utcnow() < expiry:
+            return value
+
+        del self.cache[key]
+        return None
+
+    def _cache_set(self, key: str, value: Any) -> None:
+        if not self.config.enable_caching:
+            return
+        expiry = datetime.utcnow() + timedelta(seconds=self.config.cache_ttl_seconds)
+        self.cache[key] = (value, expiry)
+
+    def set_status(self, status: AdapterStatus):
+        self.status = status
+
+    def get_status(self) -> AdapterStatus:
+        return self.status
+
+
+class BasicAuthAdapter(AuthenticationAdapter):
+    """Example username/password authentication adapter."""
+
+    def authenticate(self, request: AuthenticationRequest) -> AuthenticationResponse:
+        username = request.username
+        credentials = request.credentials
+
+        try:
+            if not self.validate_credentials(username, credentials):
+                raise AuthenticationFailedException("Invalid username or password")
+
+            user_id = username
+            attributes = self.get_user_attributes(user_id)
+            session_token = self.session_manager.create_session(user_id, attributes)
+            token_expiry = datetime.utcnow() + timedelta(seconds=self.config.cache_ttl_seconds)
+
+            return AuthenticationResponse(
+                success=True,
+                user_id=user_id,
+                session_token=session_token,
+                token_expiry=token_expiry,
+                attributes=attributes,
+            )
+        except Exception as exc:
+            logger.exception("Basic authentication failed for username=%s", username)
+            return AuthenticationResponse(
+                success=False,
+                user_id="",
+                session_token="",
+                token_expiry=datetime.utcnow(),
+                attributes={},
+                error_message=str(exc),
+                error_code=getattr(exc, "error_code", "AUTH_ERROR"),
+            )
+
+    def validate_credentials(self, username: str, credentials: Dict[str, Any]) -> bool:
+        password = credentials.get("password")
+        if not username or not password:
+            return False
+        # Real implementation should validate against your IdP or LDAP directory.
+        return True
+
+    def get_user_attributes(self, user_id: str) -> Dict[str, Any]:
+        key = f"user_attrs:{user_id}"
+        cached = self._cache_get(key)
+        if cached:
+            return cached
+
+        attrs = {
+            "user_id": user_id,
+            "email": f"{user_id}@example.com",
+            "groups": ["users"],
+            "authenticated_at": datetime.utcnow().isoformat(),
+        }
+        self._cache_set(key, attrs)
+        return attrs
+
+
+class APIKeyAdapter(AuthenticationAdapter):
+    """Example API-key authentication adapter."""
+
+    def authenticate(self, request: AuthenticationRequest) -> AuthenticationResponse:
+        username = request.username
+        credentials = request.credentials
+
+        try:
+            if not self.validate_credentials(username, credentials):
+                raise AuthenticationFailedException("Invalid API key")
+
+            user_id = username
+            attributes = self.get_user_attributes(user_id)
+            session_token = self.session_manager.create_session(user_id, attributes)
+            token_expiry = datetime.utcnow() + timedelta(seconds=self.config.cache_ttl_seconds)
+
+            return AuthenticationResponse(
+                success=True,
+                user_id=user_id,
+                session_token=session_token,
+                token_expiry=token_expiry,
+                attributes=attributes,
+            )
+        except Exception as exc:
+            logger.exception("API key authentication failed")
+            return AuthenticationResponse(
+                success=False,
+                user_id="",
+                session_token="",
+                token_expiry=datetime.utcnow(),
+                attributes={},
+                error_message=str(exc),
+                error_code=getattr(exc, "error_code", "AUTH_ERROR"),
+            )
+
+    def validate_credentials(self, username: str, credentials: Dict[str, Any]) -> bool:
+        api_key = credentials.get("api_key")
+        if not username or not api_key:
+            return False
+        return True
+
+    def get_user_attributes(self, user_id: str) -> Dict[str, Any]:
+        key = f"api_user:{user_id}"
+        cached = self._cache_get(key)
+        if cached:
+            return cached
+
+        attrs = {
+            "user_id": user_id,
+            "api_enabled": True,
+            "rate_limit": 1000,
+            "authenticated_at": datetime.utcnow().isoformat(),
+        }
+        self._cache_set(key, attrs)
+        return attrs
+
+
+class OAuth2Adapter(AuthenticationAdapter):
+    """Example OAuth2 bearer token adapter."""
+
+    def authenticate(self, request: AuthenticationRequest) -> AuthenticationResponse:
+        username = request.username
+        credentials = request.credentials
+
+        try:
+            if not self.validate_credentials(username, credentials):
+                raise AuthenticationFailedException("Invalid bearer token")
+
+            access_token = credentials.get("access_token")
+            user_info = self._fetch_user_info(access_token)
+            user_id = user_info.get("sub") or username
+            attributes = self.get_user_attributes(user_id)
+            session_token = self.session_manager.create_session(user_id, attributes)
+            token_expiry = datetime.utcnow() + timedelta(seconds=self.config.cache_ttl_seconds)
+
+            return AuthenticationResponse(
+                success=True,
+                user_id=user_id,
+                session_token=session_token,
+                token_expiry=token_expiry,
+                attributes={**attributes, **user_info},
+            )
+        except Exception as exc:
+            logger.exception("OAuth2 authentication failed")
+            return AuthenticationResponse(
+                success=False,
+                user_id="",
+                session_token="",
+                token_expiry=datetime.utcnow(),
+                attributes={},
+                error_message=str(exc),
+                error_code=getattr(exc, "error_code", "AUTH_ERROR"),
+            )
+
+    def validate_credentials(self, username: str, credentials: Dict[str, Any]) -> bool:
+        access_token = credentials.get("access_token")
+        if not username or not access_token:
+            return False
+        return True
+
+    def get_user_attributes(self, user_id: str) -> Dict[str, Any]:
+        key = f"oauth2_user:{user_id}"
+        cached = self._cache_get(key)
+        if cached:
+            return cached
+
+        attrs = {
+            "user_id": user_id,
+            "groups": ["oauth_users"],
+            "oauth2_enabled": True,
+            "authenticated_at": datetime.utcnow().isoformat(),
+        }
+        self._cache_set(key, attrs)
+        return attrs
+
+    def _fetch_user_info(self, access_token: str) -> Dict[str, Any]:
+        # Replace with a real call to your OAuth2 provider's userinfo endpoint.
+        return {
+            "sub": "oauth-user-123",
+            "name": "OAuth User",
+            "email": "oauth-user@example.com",
+        }
+
+
+class AdapterFactory:
+    _registry: Dict[AuthenticationMethod, type] = {
+        AuthenticationMethod.BASIC: BasicAuthAdapter,
+        AuthenticationMethod.API_KEY: APIKeyAdapter,
+        AuthenticationMethod.OAUTH2: OAuth2Adapter,
+    }
+
+    @classmethod
+    def create_adapter(cls, config: AdapterConfiguration) -> AuthenticationAdapter:
+        adapter_class = cls._registry.get(config.authentication_method)
+        if adapter_class is None:
+            raise ConfigurationException(f"Unsupported authentication method: {config.authentication_method}")
+        return adapter_class(config)
+
+    @classmethod
+    def register_adapter(cls, method: AuthenticationMethod, adapter_class: type):
+        cls._registry[method] = adapter_class
+
+
+class AdapterManager:
+    def __init__(self):
+        self.adapters: Dict[str, AuthenticationAdapter] = {}
+
+    def register(self, adapter: AuthenticationAdapter):
+        self.adapters[adapter.config.adapter_id] = adapter
+
+    def get(self, adapter_id: str) -> Optional[AuthenticationAdapter]:
+        return self.adapters.get(adapter_id)
+
+    def authenticate(self, adapter_id: str, request: AuthenticationRequest) -> AuthenticationResponse:
+        adapter = self.get(adapter_id)
+        if not adapter:
+            return AuthenticationResponse(
+                success=False,
+                user_id="",
+                session_token="",
+                token_expiry=datetime.utcnow(),
+                attributes={},
+                error_message=f"Adapter not found: {adapter_id}",
+                error_code="ADAPTER_NOT_FOUND",
+            )
+        return adapter.authenticate(request)
+
+    def validate_session(self, adapter_id: str, session_token: str) -> Tuple[bool, Optional[str]]:
+        adapter = self.get(adapter_id)
+        if not adapter:
+            return False, None
+        return adapter.session_manager.validate_session(session_token)
+
+
+def retry_on_failure(max_retries: int = 3, delay_ms: int = 1000):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            for attempt in range(1, max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as exc:
+                    if attempt == max_retries:
+                        raise
+                    logger.warning("Retrying %s after %s ms (attempt %s/%s): %s", func.__name__, delay_ms, attempt, max_retries, exc)
+                    time.sleep(delay_ms / 1000.0)
+        return wrapper
+    return decorator
+
+
+def mask_sensitive_data(payload: Dict[str, Any], sensitive_keys: Optional[List[str]] = None) -> Dict[str, Any]:
+    if sensitive_keys is None:
+        sensitive_keys = ["password", "api_key", "secret_key", "access_token", "token"]
+
+    masked = dict(payload)
+    for key in sensitive_keys:
+        if key in masked:
+            masked[key] = "***MASKED***"
+    return masked
+
+
+# ---------------------------------------------------------------------------
+# PingFederate-style integration example
+# ---------------------------------------------------------------------------
+
+class PingFederateClient:
+    """Simple client wrapper for PingFederate APIs."""
+
+    def __init__(self, base_url: str, api_key: str, timeout_seconds: int = 30):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.timeout_seconds = timeout_seconds
+
+    def request(self, method: str, path: str, payload: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None):
+        url = f"{self.base_url}{path}"
+        merged_headers = {"Content-Type": "application/json"}
+        if headers:
+            merged_headers.update(headers)
+        merged_headers["Authorization"] = f"Bearer {self.api_key}"
+
+        response = requests.request(
+            method=method.upper(),
+            url=url,
+            json=payload,
+            headers=merged_headers,
+            timeout=self.timeout_seconds,
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+# Example usage
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+
+    config = AdapterConfiguration(
+        adapter_id="basic-login",
+        adapter_name="Basic Login Adapter",
+        adapter_type="custom",
+        authentication_method=AuthenticationMethod.BASIC,
+        endpoint_url="https://pingfederate.example.com",
+        secret_key="super-secret-key",
+        timeout_seconds=30,
+        enable_caching=True,
+        cache_ttl_seconds=3600,
+    )
+
+    adapter = AdapterFactory.create_adapter(config)
+    manager = AdapterManager()
+    manager.register(adapter)
+
+    auth_request = AuthenticationRequest(
+        username="john.smith",
+        credentials={"password": "StrongPassword123!"},
+        request_id="req-001",
+        timestamp=datetime.utcnow(),
+        ip_address="10.0.0.25",
+        user_agent="Mozilla/5.0",
+    )
+
+    result = manager.authenticate("basic-login", auth_request)
+    print(result)
+
+    if result.success:
+        print("Session token:", result.session_token)
+        valid, user_id = manager.validate_session("basic-login", result.session_token)
+        print("Session valid:", valid, "User:", user_id)
