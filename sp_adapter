@@ -1,0 +1,701 @@
+#!/usr/bin/env python3
+"""
+PingFederate Service Provider (SP) Adapter
+===========================================
+
+This sample demonstrates how to build a Service Provider (SP) adapter in Python
+that integrates with a PingFederate Identity Provider (IDP). It includes:
+- SP configuration model
+- SAML assertion parsing and validation (without signature certificate)
+- OAuth2/OIDC token handling
+- Session token generation and validation
+- Attribute mapping and claim extraction
+- Request validation and secure logging utilities
+
+This is a framework example for SP integration work. In a real deployment,
+replace placeholder validation methods with proper certificate validation,
+JWKS endpoints, and enterprise attribute mapping logic.
+"""
+
+import hashlib
+import hmac
+import logging
+import os
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple
+from xml.etree import ElementTree as ET
+
+import requests
+
+logger = logging.getLogger("pingfederate_sp_adapter")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+
+class SPAuthenticationMethod(Enum):
+    SAML2 = "saml2"
+    OAUTH2 = "oauth2"
+    OIDC = "oidc"
+    CUSTOM = "custom"
+
+
+class SPStatus(Enum):
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+    ERROR = "error"
+    DEGRADED = "degraded"
+
+
+@dataclass
+class SPAuthenticationRequest:
+    username: str
+    credentials: Dict[str, Any]
+    request_id: str
+    timestamp: datetime
+    ip_address: Optional[str] = None
+    user_agent: Optional[str] = None
+    context: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class SPAuthenticationResponse:
+    success: bool
+    user_id: str
+    session_token: str
+    token_expiry: datetime
+    attributes: Dict[str, Any] = field(default_factory=dict)
+    error_message: Optional[str] = None
+    error_code: Optional[str] = None
+
+
+@dataclass
+class SPAdapterConfiguration:
+    adapter_id: str
+    adapter_name: str
+    adapter_type: str
+    authentication_method: SPAuthenticationMethod
+    idp_endpoint_url: str
+    accepted_issuer: str
+    audience: str
+    secret_key: Optional[str] = None
+    timeout_seconds: int = 30
+    max_retries: int = 3
+    retry_delay_ms: int = 1000
+    enable_caching: bool = True
+    cache_ttl_seconds: int = 3600
+    attribute_mapping: Dict[str, str] = field(default_factory=dict)
+    custom_config: Dict[str, Any] = field(default_factory=dict)
+
+
+class SPAdapterException(Exception):
+    def __init__(self, message: str, error_code: str = "SP_ADAPTER_ERROR"):
+        self.message = message
+        self.error_code = error_code
+        super().__init__(message)
+
+
+class SPConfigurationException(SPAdapterException):
+    def __init__(self, message: str):
+        super().__init__(message, "SP_CONFIG_ERROR")
+
+
+class SPAuthenticationFailedException(SPAdapterException):
+    def __init__(self, message: str):
+        super().__init__(message, "SP_AUTH_FAILED")
+
+
+class SPConnectionException(SPAdapterException):
+    def __init__(self, message: str):
+        super().__init__(message, "SP_CONNECTION_ERROR")
+
+
+class SPSessionManager:
+    """Creates and validates user sessions for PingFederate SP adapter integrators."""
+
+    def __init__(self, secret_key: str, ttl_seconds: int = 3600):
+        self.secret_key = secret_key or "change-me-secret"
+        self.ttl_seconds = ttl_seconds
+        self.sessions: Dict[str, Dict[str, Any]] = {}
+
+    def create_session(self, user_id: str, attributes: Dict[str, Any]) -> str:
+        token = self._generate_token(user_id)
+        expiry = datetime.utcnow() + timedelta(seconds=self.ttl_seconds)
+        self.sessions[token] = {
+            "user_id": user_id,
+            "attributes": attributes,
+            "created_at": datetime.utcnow(),
+            "expires_at": expiry,
+            "last_activity": datetime.utcnow(),
+        }
+        logger.info("Session created for user=%s token=%s", user_id, token)
+        return token
+
+    def validate_session(self, session_token: str) -> Tuple[bool, Optional[str]]:
+        session = self.sessions.get(session_token)
+        if not session:
+            return False, None
+
+        if datetime.utcnow() > session["expires_at"]:
+            del self.sessions[session_token]
+            return False, None
+
+        session["last_activity"] = datetime.utcnow()
+        return True, session["user_id"]
+
+    def destroy_session(self, session_token: str) -> bool:
+        if session_token in self.sessions:
+            del self.sessions[session_token]
+            logger.info("Session destroyed: %s", session_token)
+            return True
+        return False
+
+    def get_session_attributes(self, session_token: str) -> Optional[Dict[str, Any]]:
+        session = self.sessions.get(session_token)
+        if session and datetime.utcnow() <= session["expires_at"]:
+            return session.get("attributes")
+        return None
+
+    def _generate_token(self, user_id: str) -> str:
+        payload = f"{user_id}:{time.time()}:{os.urandom(16).hex()}"
+        signature = hmac.new(
+            self.secret_key.encode("utf-8"),
+            payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return signature
+
+
+class SPAuthenticationAdapter(ABC):
+    def __init__(self, config: SPAdapterConfiguration):
+        self.config = config
+        self.cache: Dict[str, Tuple[Any, datetime]] = {}
+        self.session_manager = SPSessionManager(
+            config.secret_key or "default-secret-key",
+            config.cache_ttl_seconds,
+        )
+        self.status = SPStatus.ACTIVE
+
+    @abstractmethod
+    def authenticate(self, request: SPAuthenticationRequest) -> SPAuthenticationResponse:
+        pass
+
+    @abstractmethod
+    def validate_assertion(self, assertion: Any) -> Dict[str, Any]:
+        """Validate assertion/token and extract claims. No signature cert validation."""
+        pass
+
+    @abstractmethod
+    def map_attributes(self, claims: Dict[str, Any]) -> Dict[str, Any]:
+        """Map IdP claims to application user attributes."""
+        pass
+
+    def _cache_get(self, key: str) -> Optional[Any]:
+        if not self.config.enable_caching:
+            return None
+
+        cached = self.cache.get(key)
+        if not cached:
+            return None
+
+        value, expiry = cached
+        if datetime.utcnow() < expiry:
+            return value
+
+        del self.cache[key]
+        return None
+
+    def _cache_set(self, key: str, value: Any) -> None:
+        if not self.config.enable_caching:
+            return
+        expiry = datetime.utcnow() + timedelta(seconds=self.config.cache_ttl_seconds)
+        self.cache[key] = (value, expiry)
+
+    def set_status(self, status: SPStatus):
+        self.status = status
+
+    def get_status(self) -> SPStatus:
+        return self.status
+
+    def _validate_basic_claims(self, claims: Dict[str, Any]) -> None:
+        """Validate issuer, audience, expiry, and subject without signature cert."""
+        issuer = claims.get("issuer")
+        audience = claims.get("audience")
+        expiry = claims.get("expires_at") or claims.get("exp")
+        subject = claims.get("user_id") or claims.get("sub") or claims.get("mail")
+
+        if not issuer:
+            raise SPAuthenticationFailedException("Missing issuer claim")
+        if issuer != self.config.accepted_issuer:
+            raise SPAuthenticationFailedException(f"Issuer mismatch: {issuer}")
+
+        if audience and audience != self.config.audience:
+            raise SPAuthenticationFailedException(f"Audience mismatch: {audience}")
+
+        if not subject:
+            raise SPAuthenticationFailedException("Missing subject claim")
+
+        if expiry:
+            try:
+                if isinstance(expiry, (int, float)):
+                    exp_dt = datetime.utcfromtimestamp(expiry)
+                else:
+                    exp_dt = datetime.fromisoformat(str(expiry).replace("Z", "+00:00"))
+                if datetime.utcnow() > exp_dt:
+                    raise SPAuthenticationFailedException("Token expired")
+            except Exception as exc:
+                if isinstance(exc, SPAuthenticationFailedException):
+                    raise
+                raise SPAuthenticationFailedException("Invalid expiry claim")
+
+
+class SAML2SPAdapter(SPAuthenticationAdapter):
+    """SAML 2.0 Service Provider adapter (no signature certificate validation)."""
+
+    def authenticate(self, request: SPAuthenticationRequest) -> SPAuthenticationResponse:
+        username = request.username
+        credentials = request.credentials
+
+        try:
+            assertion_xml = credentials.get("assertion")
+            if not assertion_xml:
+                raise SPAuthenticationFailedException("No SAML assertion supplied")
+
+            claims = self.validate_assertion(assertion_xml)
+            mapped_attrs = self.map_attributes(claims)
+
+            user_id = claims.get("user_id") or claims.get("sub") or username
+            session_token = self.session_manager.create_session(user_id, mapped_attrs)
+            token_expiry = datetime.utcnow() + timedelta(seconds=self.config.cache_ttl_seconds)
+
+            return SPAuthenticationResponse(
+                success=True,
+                user_id=user_id,
+                session_token=session_token,
+                token_expiry=token_expiry,
+                attributes=mapped_attrs,
+            )
+
+        except Exception as exc:
+            logger.exception("SAML2 authentication failed for username=%s", username)
+            return SPAuthenticationResponse(
+                success=False,
+                user_id="",
+                session_token="",
+                token_expiry=datetime.utcnow(),
+                attributes={},
+                error_message=str(exc),
+                error_code=getattr(exc, "error_code", "SP_AUTH_ERROR"),
+            )
+
+    def validate_assertion(self, assertion_xml: str) -> Dict[str, Any]:
+        """Parse SAML assertion without signature validation."""
+        try:
+            root = ET.fromstring(assertion_xml)
+
+            ns = {
+                "saml": "urn:oasis:names:tc:SAML:2.0:assertion",
+                "ds": "http://www.w3.org/2000/09/xmldsig#",
+            }
+
+            issuer = root.findtext("./saml:Issuer", default="", namespaces=ns)
+            subject = root.find("./saml:Subject/saml:NameID", ns)
+            name_id = subject.text if subject is not None else ""
+
+            authn_stmt = root.find("./saml:AuthnStatement", ns)
+            session_not_on_or_after = None
+            if authn_stmt is not None:
+                session_not_on_or_after = authn_stmt.get("SessionNotOnOrAfter")
+
+            attr_values = {}
+            for attr in root.findall("./saml:AttributeStatement/saml:Attribute", ns):
+                name = attr.get("Name")
+                values = [v.text for v in attr.findall("./saml:AttributeValue", ns) if v.text]
+                if name:
+                    attr_values[name] = values[0] if len(values) == 1 else values
+
+            claims = {
+                "issuer": issuer,
+                "user_id": name_id,
+                "sub": name_id,
+                "mail": attr_values.get("mail") or attr_values.get("email") or name_id,
+                "audience": self.config.audience,
+                "expires_at": session_not_on_or_after
+                or (datetime.utcnow() + timedelta(minutes=5)).isoformat(),
+                "attributes": attr_values,
+            }
+
+            self._validate_basic_claims(claims)
+            logger.info("SAML assertion validated for user=%s", name_id)
+            return claims
+
+        except SPAuthenticationFailedException:
+            raise
+        except Exception as exc:
+            raise SPAuthenticationFailedException(f"Failed to parse SAML assertion: {exc}")
+
+    def map_attributes(self, claims: Dict[str, Any]) -> Dict[str, Any]:
+        """Map SAML attributes to application attributes using configured mapping."""
+        mapped = {
+            "issuer": claims.get("issuer"),
+            "audience": claims.get("audience"),
+            "authenticated_at": datetime.utcnow().isoformat(),
+        }
+
+        raw_attrs = claims.get("attributes", {})
+        for saml_key, app_key in self.config.attribute_mapping.items():
+            if saml_key in raw_attrs:
+                mapped[app_key] = raw_attrs[saml_key]
+
+        # Always include common claims
+        mapped["email"] = claims.get("mail")
+        mapped["subject"] = claims.get("user_id")
+
+        return mapped
+
+
+class OAuth2SPAdapter(SPAuthenticationAdapter):
+    """OAuth2 Bearer Token Service Provider adapter (no signature validation)."""
+
+    def authenticate(self, request: SPAuthenticationRequest) -> SPAuthenticationResponse:
+        username = request.username
+        credentials = request.credentials
+
+        try:
+            access_token = credentials.get("access_token")
+            if not access_token:
+                raise SPAuthenticationFailedException("No access token supplied")
+
+            claims = self.validate_assertion(access_token)
+            mapped_attrs = self.map_attributes(claims)
+
+            user_id = claims.get("user_id") or claims.get("sub") or username
+            session_token = self.session_manager.create_session(user_id, mapped_attrs)
+            token_expiry = datetime.utcnow() + timedelta(seconds=self.config.cache_ttl_seconds)
+
+            return SPAuthenticationResponse(
+                success=True,
+                user_id=user_id,
+                session_token=session_token,
+                token_expiry=token_expiry,
+                attributes=mapped_attrs,
+            )
+
+        except Exception as exc:
+            logger.exception("OAuth2 authentication failed")
+            return SPAuthenticationResponse(
+                success=False,
+                user_id="",
+                session_token="",
+                token_expiry=datetime.utcnow(),
+                attributes={},
+                error_message=str(exc),
+                error_code=getattr(exc, "error_code", "SP_AUTH_ERROR"),
+            )
+
+    def validate_assertion(self, access_token: str) -> Dict[str, Any]:
+        """Introspect OAuth2 token to extract claims."""
+        key = f"oauth2_token:{access_token}"
+        cached = self._cache_get(key)
+        if cached:
+            return cached
+
+        try:
+            # In production, call the IDP's token introspection endpoint
+            # For demo, return a placeholder payload
+            claims = {
+                "issuer": self.config.accepted_issuer,
+                "user_id": "oauth2-user",
+                "sub": "oauth2-user",
+                "mail": "oauth2-user@example.com",
+                "audience": self.config.audience,
+                "expires_at": (datetime.utcnow() + timedelta(hours=1)).isoformat(),
+                "scope": "openid profile email",
+            }
+
+            self._validate_basic_claims(claims)
+            self._cache_set(key, claims)
+            logger.info("OAuth2 token introspected for user=%s", claims.get("user_id"))
+            return claims
+
+        except SPAuthenticationFailedException:
+            raise
+        except Exception as exc:
+            raise SPAuthenticationFailedException(f"Failed to introspect OAuth2 token: {exc}")
+
+    def map_attributes(self, claims: Dict[str, Any]) -> Dict[str, Any]:
+        """Map OAuth2 claims to application attributes."""
+        mapped = {
+            "issuer": claims.get("issuer"),
+            "audience": claims.get("audience"),
+            "scope": claims.get("scope"),
+            "authenticated_at": datetime.utcnow().isoformat(),
+            "email": claims.get("mail") or claims.get("email"),
+            "subject": claims.get("user_id") or claims.get("sub"),
+        }
+
+        for saml_key, app_key in self.config.attribute_mapping.items():
+            if saml_key in claims:
+                mapped[app_key] = claims[saml_key]
+
+        return mapped
+
+
+class OIDCSPAdapter(SPAuthenticationAdapter):
+    """OIDC (OpenID Connect) Service Provider adapter (no signature validation)."""
+
+    def authenticate(self, request: SPAuthenticationRequest) -> SPAuthenticationResponse:
+        username = request.username
+        credentials = request.credentials
+
+        try:
+            id_token = credentials.get("id_token")
+            if not id_token:
+                raise SPAuthenticationFailedException("No ID token supplied")
+
+            claims = self.validate_assertion(id_token)
+            mapped_attrs = self.map_attributes(claims)
+
+            user_id = claims.get("user_id") or claims.get("sub") or username
+            session_token = self.session_manager.create_session(user_id, mapped_attrs)
+            token_expiry = datetime.utcnow() + timedelta(seconds=self.config.cache_ttl_seconds)
+
+            return SPAuthenticationResponse(
+                success=True,
+                user_id=user_id,
+                session_token=session_token,
+                token_expiry=token_expiry,
+                attributes=mapped_attrs,
+            )
+
+        except Exception as exc:
+            logger.exception("OIDC authentication failed")
+            return SPAuthenticationResponse(
+                success=False,
+                user_id="",
+                session_token="",
+                token_expiry=datetime.utcnow(),
+                attributes={},
+                error_message=str(exc),
+                error_code=getattr(exc, "error_code", "SP_AUTH_ERROR"),
+            )
+
+    def validate_assertion(self, id_token: str) -> Dict[str, Any]:
+        """Decode OIDC ID token (no signature validation)."""
+        key = f"oidc_token:{id_token}"
+        cached = self._cache_get(key)
+        if cached:
+            return cached
+
+        try:
+            # In production, validate JWT signature using JWKS endpoint
+            # For demo, decode and validate claims only
+            parts = id_token.split(".")
+            if len(parts) != 3:
+                raise SPAuthenticationFailedException("Invalid token format")
+
+            # In real implementation, use jwt.decode() with JWKS verification
+            # This is a placeholder that assumes the payload is already decoded
+            claims = {
+                "issuer": self.config.accepted_issuer,
+                "user_id": "oidc-user",
+                "sub": "oidc-user",
+                "mail": "oidc-user@example.com",
+                "audience": self.config.audience,
+                "exp": int((datetime.utcnow() + timedelta(hours=1)).timestamp()),
+                "iat": int(datetime.utcnow().timestamp()),
+                "nonce": "example-nonce",
+            }
+
+            self._validate_basic_claims(claims)
+            self._cache_set(key, claims)
+            logger.info("OIDC token validated for user=%s", claims.get("user_id"))
+            return claims
+
+        except SPAuthenticationFailedException:
+            raise
+        except Exception as exc:
+            raise SPAuthenticationFailedException(f"Failed to decode OIDC token: {exc}")
+
+    def map_attributes(self, claims: Dict[str, Any]) -> Dict[str, Any]:
+        """Map OIDC claims to application attributes."""
+        mapped = {
+            "issuer": claims.get("issuer"),
+            "audience": claims.get("audience"),
+            "authenticated_at": datetime.utcnow().isoformat(),
+            "email": claims.get("mail") or claims.get("email"),
+            "subject": claims.get("user_id") or claims.get("sub"),
+            "nonce": claims.get("nonce"),
+        }
+
+        for oidc_key, app_key in self.config.attribute_mapping.items():
+            if oidc_key in claims:
+                mapped[app_key] = claims[oidc_key]
+
+        return mapped
+
+
+class SPAdapterFactory:
+    _registry: Dict[SPAuthenticationMethod, type] = {
+        SPAuthenticationMethod.SAML2: SAML2SPAdapter,
+        SPAuthenticationMethod.OAUTH2: OAuth2SPAdapter,
+        SPAuthenticationMethod.OIDC: OIDCSPAdapter,
+    }
+
+    @classmethod
+    def create_adapter(cls, config: SPAdapterConfiguration) -> SPAuthenticationAdapter:
+        adapter_class = cls._registry.get(config.authentication_method)
+        if adapter_class is None:
+            raise SPConfigurationException(
+                f"Unsupported authentication method: {config.authentication_method}"
+            )
+        return adapter_class(config)
+
+    @classmethod
+    def register_adapter(cls, method: SPAuthenticationMethod, adapter_class: type):
+        cls._registry[method] = adapter_class
+
+
+class SPAdapterManager:
+    def __init__(self):
+        self.adapters: Dict[str, SPAuthenticationAdapter] = {}
+
+    def register(self, adapter: SPAuthenticationAdapter):
+        self.adapters[adapter.config.adapter_id] = adapter
+        logger.info("Adapter registered: %s", adapter.config.adapter_id)
+
+    def get(self, adapter_id: str) -> Optional[SPAuthenticationAdapter]:
+        return self.adapters.get(adapter_id)
+
+    def authenticate(
+        self, adapter_id: str, request: SPAuthenticationRequest
+    ) -> SPAuthenticationResponse:
+        adapter = self.get(adapter_id)
+        if not adapter:
+            return SPAuthenticationResponse(
+                success=False,
+                user_id="",
+                session_token="",
+                token_expiry=datetime.utcnow(),
+                attributes={},
+                error_message=f"Adapter not found: {adapter_id}",
+                error_code="ADAPTER_NOT_FOUND",
+            )
+        return adapter.authenticate(request)
+
+    def validate_session(
+        self, adapter_id: str, session_token: str
+    ) -> Tuple[bool, Optional[str]]:
+        adapter = self.get(adapter_id)
+        if not adapter:
+            return False, None
+        return adapter.session_manager.validate_session(session_token)
+
+    def get_session_attributes(
+        self, adapter_id: str, session_token: str
+    ) -> Optional[Dict[str, Any]]:
+        adapter = self.get(adapter_id)
+        if not adapter:
+            return None
+        return adapter.session_manager.get_session_attributes(session_token)
+
+    def logout(self, adapter_id: str, session_token: str) -> bool:
+        adapter = self.get(adapter_id)
+        if not adapter:
+            return False
+        return adapter.session_manager.destroy_session(session_token)
+
+
+def mask_sensitive_data(
+    payload: Dict[str, Any], sensitive_keys: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    if sensitive_keys is None:
+        sensitive_keys = [
+            "password",
+            "api_key",
+            "secret_key",
+            "access_token",
+            "id_token",
+            "assertion",
+            "token",
+        ]
+
+    masked = dict(payload)
+    for key in sensitive_keys:
+        if key in masked:
+            masked[key] = "***MASKED***"
+    return masked
+
+
+# ---------------------------------------------------------------------------
+# Example usage
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+
+    # SAML 2.0 example
+    saml_config = SPAdapterConfiguration(
+        adapter_id="saml-sp",
+        adapter_name="SAML 2.0 Service Provider",
+        adapter_type="sp",
+        authentication_method=SPAuthenticationMethod.SAML2,
+        idp_endpoint_url="https://pingfederate.example.com/sp",
+        accepted_issuer="https://pingfederate.example.com",
+        audience="my-application",
+        secret_key="super-secret-key",
+        enable_caching=True,
+        cache_ttl_seconds=3600,
+        attribute_mapping={"mail": "email", "groups": "user_groups"},
+    )
+
+    saml_adapter = SPAdapterFactory.create_adapter(saml_config)
+    manager = SPAdapterManager()
+    manager.register(saml_adapter)
+
+    saml_assertion = """<?xml version="1.0" encoding="UTF-8"?>
+    <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion">
+      <saml2:Issuer>https://pingfederate.example.com</saml2:Issuer>
+      <saml2:Subject>
+        <saml2:NameID>john.smith@example.com</saml2:NameID>
+      </saml2:Subject>
+      <saml2:AuthnStatement SessionNotOnOrAfter="2026-09-29T10:30:00Z">
+        <saml2:AuthnContext/>
+      </saml2:AuthnStatement>
+      <saml2:AttributeStatement>
+        <saml2:Attribute Name="mail">
+          <saml2:AttributeValue>john.smith@example.com</saml2:AttributeValue>
+        </saml2:Attribute>
+        <saml2:Attribute Name="groups">
+          <saml2:AttributeValue>admins</saml2:AttributeValue>
+          <saml2:AttributeValue>developers</saml2:AttributeValue>
+        </saml2:Attribute>
+      </saml2:AttributeStatement>
+    </saml2:Assertion>
+    """
+
+    auth_request = SPAuthenticationRequest(
+        username="john.smith@example.com",
+        credentials={"assertion": saml_assertion},
+        request_id="req-001",
+        timestamp=datetime.utcnow(),
+        ip_address="10.0.0.25",
+        user_agent="Mozilla/5.0",
+    )
+
+    result = manager.authenticate("saml-sp", auth_request)
+    print("Authentication Result:")
+    print(result)
+
+    if result.success:
+        print("\nSession token:", result.session_token)
+        valid, user_id = manager.validate_session("saml-sp", result.session_token)
+        print("Session valid:", valid, "User:", user_id)
+
+        attrs = manager.get_session_attributes("saml-sp", result.session_token)
+        print("Session attributes:", attrs)
+
+        logged_out = manager.logout("saml-sp", result.session_token)
+        print("Logged out:", logged_out)
